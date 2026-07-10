@@ -1,86 +1,234 @@
-import SwiftUI
-import IOKit.hid
+import AppKit
+import CoreGraphics
+import OSLog
 import ServiceManagement
-import os
 
-@main struct TriplesecApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var delegate
-    var body: some Scene { Settings { EmptyView() } }
+@main
+private enum TriplesecApplication {
+  private static let delegate = AppDelegate()
+
+  static func main() {
+    let application = NSApplication.shared
+    application.delegate = delegate
+    application.run()
+  }
 }
 
-private let log = Logger(subsystem: "gg.partyhat.triplesec", category: "main")
+private let log = Logger(subsystem: "gg.partyhat.triplesec", category: "app")
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    private var tap: CFMachPort?
-    private var lastButton = -1
-    private var count = 0
-    private var lastTime: TimeInterval = 0
+private final class AppDelegate: NSObject, NSApplicationDelegate {
+  private var eventTap: CFMachPort?
+  private var eventTapSource: CFRunLoopSource?
+  private var gesture = LockGesture()
+  private lazy var screenLocker = ScreenLocker()
 
-    func applicationDidFinishLaunching(_ note: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-        if IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) != kIOHIDAccessTypeGranted {
-            IOHIDRequestAccess(kIOHIDRequestTypeListenEvent)
-            NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")!)
-        }
-        if SMAppService.mainApp.status != .enabled {
-            try? SMAppService.mainApp.register()
-        }
-        installTap()
+  func applicationDidFinishLaunching(_: Notification) {
+    guard requestInputMonitoringAccess() else {
+      NSApplication.shared.terminate(nil)
+      return
     }
 
-    private func installTap() {
-        let refcon = Unmanaged.passUnretained(self).toOpaque()
-        guard let t = CGEvent.tapCreate(
-            tap: .cgSessionEventTap,
-            place: .headInsertEventTap,
-            options: .listenOnly,
-            eventsOfInterest: CGEventMask(1 << CGEventType.otherMouseDown.rawValue),
-            callback: callback,
-            userInfo: refcon
-        ) else {
-            log.error("tap failed - grant Input Monitoring, then relaunch.")
-            return
-        }
-        tap = t
-        CFRunLoopAddSource(CFRunLoopGetMain(), CFMachPortCreateRunLoopSource(nil, t, 0), .commonModes)
-        CGEvent.tapEnable(tap: t, enable: true)
-        log.info("armed")
+    registerLoginItem()
+    installEventTap()
+  }
+
+  func applicationWillTerminate(_: Notification) {
+    if let eventTap {
+      CGEvent.tapEnable(tap: eventTap, enable: false)
+    }
+    if let eventTapSource {
+      CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapSource, .commonModes)
+    }
+  }
+
+  private func registerLoginItem() {
+    let loginItem = SMAppService.mainApp
+
+    switch loginItem.status {
+    case .enabled:
+      return
+    case .notRegistered:
+      do {
+        try loginItem.register()
+        log.info("Registered as a login item.")
+      } catch {
+        log.error(
+          "Could not register as a login item: \(error.localizedDescription, privacy: .public)")
+      }
+    case .requiresApproval:
+      log.notice("Login item needs approval in System Settings.")
+    case .notFound:
+      log.error("Could not find the app's login-item service.")
+    @unknown default:
+      log.error("Encountered an unknown login-item status.")
+    }
+  }
+
+  private func requestInputMonitoringAccess() -> Bool {
+    if CGPreflightListenEventAccess() {
+      return true
     }
 
-    fileprivate func handle(_ type: CGEventType, _ event: CGEvent) {
-        if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            if let tap { CGEvent.tapEnable(tap: tap, enable: true) }
-            return
-        }
-        let button = Int(event.getIntegerValueField(.mouseEventButtonNumber))
-        guard type == .otherMouseDown, button >= 3 else { return }   // 0=L 1=R 2=mid, 3+=side
-
-        let now = ProcessInfo.processInfo.systemUptime
-        if button == lastButton && now - lastTime <= 0.5 {
-            count += 1
-        } else {
-            count = 1
-        }
-        lastButton = button
-        lastTime = now
-
-        guard count >= 3 else { return }
-        count = 0
-        lastButton = -1
-        lock()
+    if CGRequestListenEventAccess() {
+      return true
     }
 
-    // CGSession was removed in macOS 26; use login.framework's private lock.
-    private func lock() {
-        guard let handle = dlopen("/System/Library/PrivateFrameworks/login.framework/Versions/A/login", RTLD_NOW),
-              let sym = dlsym(handle, "SACLockScreenImmediate") else { return }
-        _ = unsafeBitCast(sym, to: (@convention(c) () -> Int32).self)()
+    openInputMonitoringSettings()
+    log.notice("Input Monitoring is required; grant access, then reopen Triplesec.")
+    return false
+  }
+
+  private func openInputMonitoringSettings() {
+    let settingsURL = URL(
+      string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"
+    )!
+    NSWorkspace.shared.open(settingsURL)
+  }
+
+  private func installEventTap() {
+    let eventMask = CGEventMask(1) << CGEventType.otherMouseDown.rawValue
+    let refcon = Unmanaged.passUnretained(self).toOpaque()
+
+    guard
+      let eventTap = CGEvent.tapCreate(
+        tap: .cgSessionEventTap,
+        place: .headInsertEventTap,
+        options: .listenOnly,
+        eventsOfInterest: eventMask,
+        callback: eventTapCallback,
+        userInfo: refcon
+      )
+    else {
+      log.error("Could not create the mouse event tap.")
+      return
     }
+
+    let source = CFMachPortCreateRunLoopSource(nil, eventTap, 0)
+    self.eventTap = eventTap
+    eventTapSource = source
+    CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+    CGEvent.tapEnable(tap: eventTap, enable: true)
+    log.info("Listening for the lock gesture.")
+  }
+
+  func handleEvent(type: CGEventType, event: CGEvent) {
+    if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+      if let eventTap {
+        CGEvent.tapEnable(tap: eventTap, enable: true)
+        log.notice("Mouse event tap was disabled and has been re-enabled.")
+      }
+      return
+    }
+
+    guard type == .otherMouseDown else {
+      return
+    }
+
+    let button = Int(event.getIntegerValueField(.mouseEventButtonNumber))
+    guard button >= LockGesture.minimumButtonNumber else {
+      return
+    }
+
+    let time = ProcessInfo.processInfo.systemUptime
+    guard gesture.recordPress(of: button, at: time) else {
+      return
+    }
+
+    screenLocker.lock()
+  }
 }
 
-private let callback: CGEventTapCallBack = { _, type, event, refcon in
-    if let refcon {
-        Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue().handle(type, event)
+private struct LockGesture {
+  static let minimumButtonNumber = 3
+  static let requiredPresses = 3
+  static let maximumInterval: TimeInterval = 0.5
+
+  private var lastButton: Int?
+  private var lastPressTime: TimeInterval?
+  private var pressCount = 0
+
+  mutating func recordPress(of button: Int, at time: TimeInterval) -> Bool {
+    let continuesSequence =
+      button == lastButton
+      && lastPressTime.map { time - $0 <= Self.maximumInterval } == true
+
+    pressCount = continuesSequence ? pressCount + 1 : 1
+    lastButton = button
+    lastPressTime = time
+
+    guard pressCount >= Self.requiredPresses else {
+      return false
     }
+
+    reset()
+    return true
+  }
+
+  private mutating func reset() {
+    lastButton = nil
+    lastPressTime = nil
+    pressCount = 0
+  }
+}
+
+private final class ScreenLocker {
+  private typealias LockScreenFunction = @convention(c) () -> Int32
+
+  private let frameworkHandle: UnsafeMutableRawPointer?
+  private let lockScreenFunction: LockScreenFunction?
+
+  init() {
+    let frameworkPath = "/System/Library/PrivateFrameworks/login.framework/login"
+
+    guard let handle = dlopen(frameworkPath, RTLD_NOW) else {
+      frameworkHandle = nil
+      lockScreenFunction = nil
+      log.error("Could not open login.framework: \(Self.dynamicLoaderError, privacy: .public)")
+      return
+    }
+
+    guard let symbol = dlsym(handle, "SACLockScreenImmediate") else {
+      let loaderError = Self.dynamicLoaderError
+      dlclose(handle)
+      frameworkHandle = nil
+      lockScreenFunction = nil
+      log.error("Could not find the screen-lock function: \(loaderError, privacy: .public)")
+      return
+    }
+
+    frameworkHandle = handle
+    lockScreenFunction = unsafeBitCast(symbol, to: LockScreenFunction.self)
+  }
+
+  deinit {
+    if let frameworkHandle {
+      dlclose(frameworkHandle)
+    }
+  }
+
+  func lock() {
+    guard let lockScreenFunction else {
+      log.error("Screen locking is unavailable.")
+      return
+    }
+
+    _ = lockScreenFunction()
+  }
+
+  private static var dynamicLoaderError: String {
+    guard let message = dlerror() else {
+      return "unknown dynamic-loader error"
+    }
+    return String(cString: message)
+  }
+}
+
+private let eventTapCallback: CGEventTapCallBack = { _, type, event, refcon in
+  guard let refcon else {
     return Unmanaged.passUnretained(event)
+  }
+
+  let delegate = Unmanaged<AppDelegate>.fromOpaque(refcon).takeUnretainedValue()
+  delegate.handleEvent(type: type, event: event)
+  return Unmanaged.passUnretained(event)
 }
