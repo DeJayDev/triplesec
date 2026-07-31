@@ -1,53 +1,31 @@
 # Triplesec
 
-Lock your Mac by pressing a mouse side button three times.
+Triple-press a mouse side button to lock your Mac.
 
-Triplesec is for a very specific annoyance: you use a MacBook with the lid
-closed and an external display attached, then get up and walk away. Because the
-Mac is still driving that display, closing the lid did not put it to sleep—and
-the screen you thought you had left safely behind is still unlocked.
+For one situation: a MacBook with the lid closed and an external display
+attached keeps the screen awake and unlocked. Triplesec is invisible — no
+window, Dock icon, or menu bar item — runs at login, and writes nothing to disk.
 
-With Triplesec running, press either side button on your mouse three times in
-quick succession. Your Mac locks. That is the whole app.
+## Gesture
 
-Your back and forward buttons still work normally. Triplesec only listens for
-the three presses; it does not intercept them or do anything with your
-keyboard.
+- 3 presses of any one side button, ≤ 0.5s apart
+- Back/forward keep working; left, right, and middle clicks are ignored
 
-## What to expect
+## Requirements
 
-Triplesec is deliberately invisible. It has no window, Dock icon, or menu bar
-item. The first time you open it, macOS asks for **Input Monitoring** permission.
-Grant access, open Triplesec again, and it will run in the background and start
-automatically when you log in. If macOS says the login item needs approval,
-enable Triplesec in **System Settings → General → Login Items**.
+- macOS 26.5+
+- A mouse with side buttons
+- Xcode and a Developer ID Application certificate
 
-The lock gesture is:
+## Caveats
 
-- three presses of the same side button
-- no more than half a second between presses
-- any side button; left, right, and middle clicks are ignored
+- Locks via a private macOS function: not App Store-compatible, and may break on
+  a future macOS update.
+- Needs Input Monitoring permission.
 
-This is a small personal utility, not a polished downloadable app. There is no
-prebuilt release yet, so trying it currently means building it from source.
+## Install
 
-## Before you install it
-
-You will need:
-
-- macOS 26.5 or later
-- a mouse with side buttons
-- Xcode and a Developer ID Application signing certificate
-
-Triplesec uses a private macOS function to lock the screen. That makes it fine
-for a personal build, but unsuitable for the App Store and more likely to break
-after a future macOS update. If you would rather not give a background utility
-Input Monitoring access or run code that relies on a private system framework,
-this app is not a good fit for you.
-
-## Build and install
-
-Replace the certificate name and team ID below with your own:
+No prebuilt release; build from source. Replace `<YOUR NAME>` and `<TEAM ID>`.
 
 ```sh
 xcodebuild -project Triplesec.xcodeproj -scheme Triplesec -configuration Release \
@@ -57,7 +35,7 @@ xcodebuild -project Triplesec.xcodeproj -scheme Triplesec -configuration Release
   DEVELOPMENT_TEAM=<TEAM ID>
 ```
 
-Then sign the finished app without Xcode's development entitlement:
+Sign without Xcode's development entitlement:
 
 ```sh
 codesign --force --options runtime --timestamp \
@@ -65,57 +43,54 @@ codesign --force --options runtime --timestamp \
   build/Build/Products/Release/Triplesec.app
 ```
 
-Copy it to `/Applications` and open it:
+Install and launch:
 
 ```sh
 ditto build/Build/Products/Release/Triplesec.app /Applications/Triplesec.app
 open /Applications/Triplesec.app
 ```
 
-When macOS opens the Input Monitoring settings, enable Triplesec and then open
-the app once more. Keep it in `/Applications`: both the permission and its
-login-item registration are associated with that installed copy.
+Then:
 
-If you rebuild with a different signing certificate, macOS will treat it as a
-different app and ask you to grant Input Monitoring again.
+1. Grant **Input Monitoring** when prompted, and reopen the app.
+2. If prompted, enable the login item in **System Settings → General → Login
+   Items**.
 
-## Change the gesture
+Keep the app in `/Applications` — the permission and login-item registration
+bind to that copy. A different signing certificate counts as a new app and
+re-prompts for Input Monitoring.
 
-There is no settings screen. The three parts of the gesture are constants on
-`LockGesture` in `Triplesec/TriplesecApp.swift`:
+## Configure
 
-| Behavior | Default | What to change |
+Triplesec has no settings screen. Edit `LockGesture` in
+`Triplesec/TriplesecApp.swift`, then rebuild and reinstall.
+
+| Constant | Default | Controls |
 | --- | --- | --- |
-| Side button | Any (`minimumButtonNumber = 3`) | Change the minimum button number |
-| Number of presses | Three (`requiredPresses = 3`) | Change the required press count |
-| Time between presses | 0.5 seconds | Change `maximumInterval` |
+| `minimumButtonNumber` | `3` (any side button) | Which side button |
+| `requiredPresses` | `3` | Press count |
+| `maximumInterval` | `0.5` | Max seconds between presses |
 
-Mouse button numbers are 0 for left, 1 for right, 2 for middle, and 3 or higher
-for side buttons. After changing the gesture, rebuild and reinstall the app.
+Button numbers: 0 left, 1 right, 2 middle, 3+ side.
 
-## Remove it
+## Uninstall
 
-Turn off Triplesec in **System Settings → General → Login Items**, quit the
-running process in Activity Monitor, and delete `/Applications/Triplesec.app`.
+1. **System Settings → General → Login Items** → turn off Triplesec.
+2. Quit Triplesec in Activity Monitor.
+3. Delete `/Applications/Triplesec.app`.
 
-## A note about screen security
+## Security
 
-Triplesec is a convenient lock button, not a replacement for macOS security
-settings. Set **System Settings → Lock Screen → Require password after screen
-saver begins or display is turned off** to **Immediately**. That setting is what
-protects your Mac when you forget the gesture.
+Triplesec is a convenience and must be coupled with good security posture.
 
-<details>
-<summary>Implementation notes</summary>
+Ensure that **System Settings → Lock Screen → Require password after screen
+saver begins or display is turned off** is set to **Immediately**.
 
-Triplesec installs a listen-only `CGEvent` tap for side-button mouse-down events,
-so the original clicks continue to their normal destination. Once it recognizes
-the gesture, it calls `SACLockScreenImmediate` from the private `login.framework`.
-It registers the installed app as a login item with `SMAppService` and does not
-write any data to disk.
+## How it works
 
-The build is signed but not notarized. To distribute it to another Mac without
-the usual Gatekeeper warning, notarize and staple it with
-`xcrun notarytool submit` and `xcrun stapler staple`.
+Installs a listen-only `CGEvent` tap on side-button mouse-down, so clicks reach
+their normal target. On the gesture, calls `SACLockScreenImmediate` from the
+private `login.framework`. Registers the login item via `SMAppService`.
 
-</details>
+Signed but not notarized, so other Macs show a Gatekeeper warning. To remove it,
+notarize and staple: `xcrun notarytool submit`, then `xcrun stapler staple`.
